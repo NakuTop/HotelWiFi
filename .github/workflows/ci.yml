@@ -1,0 +1,47 @@
+name: macOS checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Test and build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+      - name: Simulated and loopback tests (no WiFi changes)
+        run: bash Scripts/test.sh
+      - name: Build universal app without private signing keys
+        env:
+          HOTELWIFI_ADHOC: '1'
+        run: |
+          set -o pipefail
+          bash Scripts/build.sh 2>&1 | tee Evidence/build.log
+      - name: Verify both executable architectures
+        run: |
+          for binary in HotelWiFiApp hotelwifi HotelWiFiHelper; do
+            xcrun lipo -verify_arch arm64 x86_64 "dist/HotelWiFi.app/Contents/MacOS/$binary"
+          done
+      - name: Save CI results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checks-${{ matrix.os }}
+          path: Evidence/*.log
+          retention-days: 14

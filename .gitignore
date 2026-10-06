@@ -1,0 +1,17 @@
+.build/
+dist/
+.DS_Store
+*.xcuserstate
+Evidence/
+.hotelwifi-build.*/
+.local-signing/
+.update-backups/
+.release-check/
+__pycache__/
+*.py[cod]
+*.keychain-db
+*.p12
+*.pfx
+*.pem
+.env
+.env.*
