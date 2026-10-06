@@ -50,7 +50,7 @@ public actor OptimizationEngine {
         return (n, inspector.capabilities(n, helper: h.ok, curl: version, helperDetail: detail, associationIdentityReadable: h.associationIdentityReadable))
     }
     public func observeChanges() {
-        if events == nil { events = NetworkEvents(keysHandler: { [weak self] keys in Task { await self?.changed(keys) } }) }
+        if events == nil { events = NetworkEvents(keysHandler: { [weak self] keys in Task { [weak self] in await self?.changed(keys) } }) }
     }
     private func changed(_ keys: [String]) async {
         guard !ownTransition, let expected else { return }

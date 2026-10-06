@@ -41,7 +41,7 @@ SwiftUI、Core、CLI、Helper 和恢复测试程序均已构建。发布包本�
 
 ## 1.2.0 build 14 公开分发
 
-本次仅调整发行包装与文档，应用功能沿用 build 13。默认构建改为 arm64 + x86_64 通用包，最低系统目标为 macOS 14；提供可拖入 Applications 的 DMG、ZIP 和 SHA-256 校验文件。签名私钥、恢复日志、诊断记录、旧安装备份不进入源码或安装包。
+应用功能沿用 build 13；网络事件回调显式声明内部 Task 的弱引用，兼容较早 Swift 编译器的并发检查。默认构建改为 arm64 + x86_64 通用包，最低系统目标为 macOS 14；提供可拖入 Applications 的 DMG、ZIP 和 SHA-256 校验文件。签名私钥、恢复日志、诊断记录、旧安装备份不进入源码或安装包。
 
 GitHub Actions 在 macOS 14 / Apple Silicon 和 macOS 15 / Intel 上执行默认模拟/回环测试、通用构建与包验证；执行结果以对应提交的 Actions 状态为准。CI 使用 ad-hoc 签名，不承担需要用户批准的特权服务验收。正式发布使用项目专用证书，尚未 Developer ID 签名或 Apple 公证。
 
