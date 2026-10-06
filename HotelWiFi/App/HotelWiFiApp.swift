@@ -46,22 +46,22 @@ import Darwin
         super.init(); location.delegate = self
         do { policy = try settings?.policy() ?? .init() } catch { self.error = error.localizedDescription }
         if engine == nil { error = "无法打开私有恢复存储。请复制诊断，检查 HotelWiFi 数据目录的权限。" }
-        events = NetworkEvents { [weak self] in Task { @MainActor in
+        events = NetworkEvents { [weak self] in Task { @MainActor [weak self] in
             guard let self else { return }
             self.liveStatusValid = false
             self.refreshTask?.cancel()
             self.refreshTask = Task { try? await Task.sleep(nanoseconds: 300_000_000); if !Task.isCancelled { await self.refresh() } }
         } }
         sleepObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.liveStatusValid = false; _ = await self?.engine?.stop() }
+            Task { @MainActor [weak self] in self?.liveStatusValid = false; _ = await self?.engine?.stop() }
         })
         sleepObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.liveStatusValid = false; self?.status = "已唤醒，请重新检查当前连接"; await self?.refresh() }
+            Task { @MainActor [weak self] in self?.liveStatusValid = false; self?.status = "已唤醒，请重新检查当前连接"; await self?.refresh() }
         })
         activationObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             // TCC and background-service approval changes need not generate a
             // network event. Re-read both whenever the user returns to the app.
-            Task { @MainActor in await self?.refresh() }
+            Task { @MainActor [weak self] in await self?.refresh() }
         }
         Task {
             await engine?.observeChanges(); await refresh()
@@ -158,7 +158,7 @@ import Darwin
             do {
                 try await engine.selectCandidate(candidates.first(where: { $0.id == candidateID }), approvePossibleCost: candidateCostApproved)
                 report = try await engine.run(mode: dry ? .dryRun : .optimize, policy: policy, endpoints: settings?.endpoints() ?? ProbeEndpoint.defaults) { [weak self] p in
-                    Task { @MainActor in self?.status = p.message; self?.completed = p.completed; self?.total = p.total }
+                    Task { @MainActor [weak self] in self?.status = p.message; self?.completed = p.completed; self?.total = p.total }
                 }
                 liveStatusValid = report?.currentValidatedAt != nil
                 status = report?.conclusion ?? "检查结束"; await refresh()
