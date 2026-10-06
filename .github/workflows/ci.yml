@@ -36,7 +36,7 @@ jobs:
       - name: Verify both executable architectures
         run: |
           for binary in HotelWiFiApp hotelwifi HotelWiFiHelper; do
-            xcrun lipo -verify_arch arm64 x86_64 "dist/HotelWiFi.app/Contents/MacOS/$binary"
+            xcrun lipo "dist/HotelWiFi.app/Contents/MacOS/$binary" -verify_arch arm64 x86_64
           done
       - name: Save CI results
         if: always()

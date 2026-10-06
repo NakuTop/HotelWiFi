@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$PROJECT_DIR/dist/HotelWiFi.app"
 bash "$PROJECT_DIR/Scripts/verify-package.sh" "$APP_DIR"
 for BINARY in HotelWiFiApp hotelwifi HotelWiFiHelper; do
-    xcrun lipo -verify_arch arm64 x86_64 "$APP_DIR/Contents/MacOS/$BINARY"
+    xcrun lipo "$APP_DIR/Contents/MacOS/$BINARY" -verify_arch arm64 x86_64
 done
 STAGE_DIR="$(mktemp -d "$PROJECT_DIR/.hotelwifi-build.release.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
