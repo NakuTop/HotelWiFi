@@ -23,7 +23,7 @@ public final class SettingsStore: @unchecked Sendable {
 }
 public enum ReportBuilder {
     public static func operationName(_ value: String) -> String {
-        ["dnsServers": "临时 DNS 调整", "autoProxyDiscovery": "自动代理发现调整", "renewDHCP": "请求 DHCP 地址恢复", "reconnect": "重新关联当前网络", "associate": "请求关联已选网络"][value] ?? value
+        ["automaticAP": "自动择优切换 AP", "dnsServers": "临时 DNS 调整", "autoProxyDiscovery": "自动代理发现调整", "renewDHCP": "请求 DHCP 地址恢复", "reconnect": "重新关联当前网络", "associate": "请求关联已选网络"][value] ?? value
     }
     public static func supportText(_ report: SessionReport, currentState: String = "结果对应下方测试时间，请先确认当前连接是否变化。") -> String {
         "请根据以下 HotelWiFi 实测报告帮助我排查 macOS WiFi。先区分事实与推测；如需终端命令，请先读取当前状态，再逐项操作并说明恢复方法。不要忽略 TLS、关闭安全功能或覆盖我后续的网络设置。\n\n" + currentState + "\n\n" + text(report)
@@ -33,7 +33,7 @@ public enum ReportBuilder {
         let r = PrivacyFilter.exported(source)
         var lines = ["HotelWiFi 诊断报告", "格式版本：\(r.schemaVersion)", "时间：\(r.started.formatted())", "模式：\(r.mode)",
                      "结论：\(r.conclusion)", "证据：\(r.evidence)", "实际接收有效载荷：\(r.payloadBytes) 字节",
-                     "应用版本：1.2.0",
+                     "应用版本：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.4.1")",
                      "最终验证时间：\(r.currentValidatedAt?.formatted() ?? "未通过当前连接验证")",
                      "隐私：默认移除网络身份、服务名称和标识；不保存密码、门户参数或响应正文。", ""]
         if let c = r.current {

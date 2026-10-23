@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$PROJECT_DIR/dist/HotelWiFi.app"
 bash "$PROJECT_DIR/Scripts/verify-package.sh" "$APP_DIR"
-for BINARY in HotelWiFiApp hotelwifi HotelWiFiHelper; do
+for BINARY in HotelWiFiApp hotelwifi HotelWiFiHelper HotelWiFiRadioAgent; do
     xcrun lipo "$APP_DIR/Contents/MacOS/$BINARY" -verify_arch arm64 x86_64
 done
 STAGE_DIR="$(mktemp -d "$PROJECT_DIR/.hotelwifi-build.release.XXXXXX")"

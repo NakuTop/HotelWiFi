@@ -17,7 +17,7 @@ public struct CodeSigningTrust: Equatable, Sendable {
         } else { return nil }
     }
     public func requirement(identifiers: [String]) -> String? {
-        let allowed = Set(["com.hotelwifi.app", "com.hotelwifi.cli", "com.hotelwifi.helper"])
+        let allowed = Set(["com.hotelwifi.app", "com.hotelwifi.cli", "com.hotelwifi.helper", "com.hotelwifi.radioagent"])
         guard !identifiers.isEmpty, identifiers.allSatisfy(allowed.contains) else { return nil }
         let anchor = kind == .developerTeam ? "anchor apple generic and certificate leaf[subject.OU] = \"\(value)\"" : "anchor = H\"\(value)\""
         return anchor + " and (" + identifiers.map { "identifier \"\($0)\"" }.joined(separator: " or ") + ")"

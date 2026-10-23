@@ -13,7 +13,7 @@ def output(*args):
 
 app = Path(sys.argv[1])
 executables = [app / 'Contents/MacOS' / name
-               for name in ('HotelWiFiApp', 'hotelwifi', 'HotelWiFiHelper')]
+               for name in ('HotelWiFiApp', 'hotelwifi', 'HotelWiFiHelper', 'HotelWiFiRadioAgent')]
 libraries = list((app / 'Contents/Frameworks').glob('*.dylib'))
 expected = set(output('/usr/bin/lipo', '-archs', str(executables[0])).split())
 assert expected and expected <= {'arm64', 'x86_64'}, 'Unsupported architecture'

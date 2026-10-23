@@ -2,12 +2,14 @@ import Foundation
 import HotelWiFiCore
 import HotelWiFiPlatform
 import SystemConfiguration
+import Security
+import CoreWLAN
 import IOKit
 import IOKit.pwr_mgt
 
 enum CallerValidation {
     static func requirement() -> String? {
-        CodeSigningTrust.current()?.requirement(identifiers: ["com.hotelwifi.app", "com.hotelwifi.cli"])
+        CodeSigningTrust.current()?.requirement(identifiers: ["com.hotelwifi.app", "com.hotelwifi.cli", "com.hotelwifi.radioagent"])
     }
     static func consoleUser(_ uid: uid_t) -> Bool {
         var console: uid_t = 0, group: gid_t = 0
@@ -83,7 +85,14 @@ final class RecoveryGuardian: NSObject, NSXPCListenerDelegate {
         let id = UUID(), uid = connection.effectiveUserIdentifier
         connection.setCodeSigningRequirement(requirement)
         connection.exportedInterface = NSXPCInterface(with: GuardianXPC.self)
-        connection.exportedObject = GuardianEndpoint(guardian: self, id: id, uid: uid)
+        var guest: SecCode?
+        let attributes = [kSecGuestAttributePid as String: NSNumber(value: connection.processIdentifier)] as CFDictionary
+        var radioRequirement: SecRequirement?
+        let source = CodeSigningTrust.current()?.requirement(identifiers: ["com.hotelwifi.radioagent"])
+        let radioPeer = source.map { SecRequirementCreateWithString($0 as CFString, [], &radioRequirement) == errSecSuccess } == true &&
+            SecCodeCopyGuestWithAttributes(nil, attributes, [], &guest) == errSecSuccess &&
+            guest.map { SecCodeCheckValidity($0, [], radioRequirement) == errSecSuccess } == true
+        connection.exportedObject = GuardianEndpoint(guardian: self, id: id, uid: uid, radioPeer: radioPeer)
         connection.invalidationHandler = { [weak self] in
             self?.queue.async {
                 guard let self else { return }
@@ -126,7 +135,8 @@ final class RecoveryGuardian: NSObject, NSXPCListenerDelegate {
             _ = try coordinator.tick(now: Date(), sleeping: sleeping, sameContext: matches && configMatches)
         } catch { startupError = error.localizedDescription }
     }
-    func perform(_ request: GuardianRequest, connection: UUID, uid: uid_t) throws -> GuardianResponse {
+    func perform(_ request: GuardianRequest, connection: UUID, uid: uid_t, radioPeer: Bool = false) throws -> GuardianResponse {
+        guard !radioPeer || [.status, .disassociateForAP].contains(request.action) else { throw HWError.blocked("无线 Agent 无权修改 DNS 或其他系统设置。") }
         guard CallerValidation.consoleUser(uid) else { throw HWError.blocked("调用者不再是当前登录用户。") }
         if request.action == .status {
             if let startupError { return .init(ok: false, message: startupError, managedConfiguration: managed) }
@@ -152,6 +162,25 @@ final class RecoveryGuardian: NSObject, NSXPCListenerDelegate {
         guard startupError == nil, !sleeping else { throw HWError.blocked(startupError ?? "系统正在睡眠，暂停操作。") }
         if [.scanCandidates, .prepareLink, .armLink, .applyLink, .commitLink, .heartbeatLink].contains(request.action) {
             return try performLink(request, connection: connection, uid: uid)
+        }
+        if request.action == .disassociateForAP {
+            guard radioPeer, request.policy?.allowAutomaticAP == true,
+                  let when = request.requestedAt, abs(Date().timeIntervalSince(when)) < 10,
+                  let nonce = request.nonce, UUID(uuidString: nonce) != nil,
+                  request.transaction != nil, (attempts[nonce] ?? 0) < 2,
+                  !linkBusy, try coordinator.journal.load()?.terminal != false,
+                  try links.journal.load()?.terminal != false, let supplied = request.context,
+                  let name = supplied.interface, supplied.wifiOn == true else { throw HWError.blocked("无线断开请求不属于已认证的会话 Agent 或已过期。") }
+            let actual = inspector.read(session: supplied.sessionID, privacy: .init(key: Data(nonce.utf8))).context
+            managed = Self.readManagedProfiles()
+            guard RadioPrivilegeGate.permits(request, actual: actual, managed: managed, radioPeer: radioPeer),
+                  let interface = CWWiFiClient.shared().interface(withName: name), interface.powerOn() else {
+                throw HWError.blocked("无线接口、配置或管理状态已变化，未执行断开。")
+            }
+            attempts[nonce, default: 0] += 1
+            if attempts.count > 64 { attempts = [nonce: attempts[nonce]!] }
+            interface.disassociate()
+            return .init(ok: true, message: "特权服务已执行一次无线关联断开；保持 WiFi 电源及全部配置")
         }
         if request.action == .prepare {
             guard !linkBusy, try links.journal.load()?.terminal != false else { throw HWError.busy }
@@ -231,14 +260,14 @@ final class RecoveryGuardian: NSObject, NSXPCListenerDelegate {
 }
 final class GuardianEndpoint: NSObject, GuardianXPC {
     unowned let guardian: RecoveryGuardian
-    let id: UUID; let uid: uid_t
-    init(guardian: RecoveryGuardian, id: UUID, uid: uid_t) { self.guardian = guardian; self.id = id; self.uid = uid }
+    let id: UUID; let uid: uid_t; let radioPeer: Bool
+    init(guardian: RecoveryGuardian, id: UUID, uid: uid_t, radioPeer: Bool) { self.guardian = guardian; self.id = id; self.uid = uid; self.radioPeer = radioPeer }
     func request(_ data: Data, withReply reply: @escaping (Data) -> Void) {
         guardian.queue.async {
             let response: GuardianResponse
             do {
                 guard data.count <= 512_000 else { throw HWError.invalid("XPC 请求超限。") }
-                response = try self.guardian.perform(JSONCoding.decoder.decode(GuardianRequest.self, from: data), connection: self.id, uid: self.uid)
+                response = try self.guardian.perform(JSONCoding.decoder.decode(GuardianRequest.self, from: data), connection: self.id, uid: self.uid, radioPeer: self.radioPeer)
             } catch { response = .init(ok: false, message: error.localizedDescription) }
             reply((try? JSONCoding.encoder.encode(response)) ?? Data())
         }

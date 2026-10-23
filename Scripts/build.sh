@@ -20,8 +20,8 @@ OUTPUT_DIR="$PROJECT_DIR/dist"
 STAGE_DIR="$(mktemp -d "$PROJECT_DIR/.hotelwifi-build.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 APP_DIR="$STAGE_DIR/HotelWiFi.app"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Library/LaunchDaemons" "$APP_DIR/Contents/Frameworks" "$OUTPUT_DIR"
-for BINARY in HotelWiFiApp hotelwifi HotelWiFiHelper; do
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Library/LaunchAgents" "$APP_DIR/Contents/Library/LaunchDaemons" "$APP_DIR/Contents/Frameworks" "$OUTPUT_DIR"
+for BINARY in HotelWiFiApp hotelwifi HotelWiFiHelper HotelWiFiRadioAgent; do
     INPUTS=()
     for BIN_DIR in "${BIN_DIRS[@]}"; do INPUTS+=("$BIN_DIR/$BINARY"); done
     if [[ ${#INPUTS[@]} -eq 1 ]]; then
@@ -32,12 +32,13 @@ for BINARY in HotelWiFiApp hotelwifi HotelWiFiHelper; do
 done
 cp HotelWiFi/Resources/Info.plist "$APP_DIR/Contents/Info.plist"
 cp HotelWiFi/Resources/com.hotelwifi.RecoveryGuardian.plist "$APP_DIR/Contents/Library/LaunchDaemons/"
+cp HotelWiFi/Resources/com.hotelwifi.RadioAgent.plist "$APP_DIR/Contents/Library/LaunchAgents/"
 cp README.md "$APP_DIR/Contents/Resources/使用说明.md"
 cp -R Docs "$APP_DIR/Contents/Resources/Docs"
 swift Scripts/MakeIcon.swift "$STAGE_DIR/HotelWiFi.iconset"
 iconutil -c icns "$STAGE_DIR/HotelWiFi.iconset" -o "$APP_DIR/Contents/Resources/HotelWiFi.icns"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string HotelWiFi' "$APP_DIR/Contents/Info.plist"
-xcrun swift-stdlib-tool --copy --scan-executable "$APP_DIR/Contents/MacOS/HotelWiFiApp" --scan-executable "$APP_DIR/Contents/MacOS/hotelwifi" --scan-executable "$APP_DIR/Contents/MacOS/HotelWiFiHelper" --destination "$APP_DIR/Contents/Frameworks" --platform macosx
+xcrun swift-stdlib-tool --copy --scan-executable "$APP_DIR/Contents/MacOS/HotelWiFiApp" --scan-executable "$APP_DIR/Contents/MacOS/hotelwifi" --scan-executable "$APP_DIR/Contents/MacOS/HotelWiFiHelper" --scan-executable "$APP_DIR/Contents/MacOS/HotelWiFiRadioAgent" --destination "$APP_DIR/Contents/Frameworks" --platform macosx
 SIGN_ARGS=(--force --options runtime --sign "$SIGNING_IDENTITY")
 if [[ -n "${HOTELWIFI_SIGNING_KEYCHAIN:-}" ]]; then SIGN_ARGS+=(--keychain "$HOTELWIFI_SIGNING_KEYCHAIN"); fi
 if [[ "$SIGNING_IDENTITY" == "-" || "${HOTELWIFI_LOCAL_SIGNING:-0}" == "1" ]]; then SIGN_ARGS+=(--timestamp=none); else SIGN_ARGS+=(--timestamp); fi
@@ -47,6 +48,8 @@ for library in "$APP_DIR"/Contents/Frameworks/*.dylib; do
 done
 codesign "${SIGN_ARGS[@]}" --identifier com.hotelwifi.cli "$APP_DIR/Contents/MacOS/hotelwifi"
 codesign "${SIGN_ARGS[@]}" --identifier com.hotelwifi.helper "$APP_DIR/Contents/MacOS/HotelWiFiHelper"
+codesign "${SIGN_ARGS[@]}" --entitlements HotelWiFi/Resources/HotelWiFi.entitlements --identifier com.hotelwifi.radioagent "$APP_DIR/Contents/MacOS/HotelWiFiRadioAgent"
+python3 "$PROJECT_DIR/Scripts/agent-constraint.py" write "$APP_DIR"
 python3 "$PROJECT_DIR/Scripts/helper-constraint.py" write "$APP_DIR"
 codesign "${SIGN_ARGS[@]}" --entitlements HotelWiFi/Resources/HotelWiFi.entitlements --identifier com.hotelwifi.app "$APP_DIR"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"

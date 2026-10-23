@@ -13,14 +13,16 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2.0</string>
+	<string>1.4.1</string>
 	<key>CFBundleVersion</key>
-	<string>14</string>
+	<string>18</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
-	<key>NSHighResolutionCapable</key>
+	<key>NSAppTransportSecurity</key>
+    <dict><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict>
+    <key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSLocationUsageDescription</key>
 	<string>仅用于读取当前 WiFi 网络身份，不采集位置。</string>

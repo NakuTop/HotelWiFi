@@ -7,6 +7,7 @@ let package = Package(
                .executable(name: "HotelWiFiApp", targets: ["HotelWiFiApp"]),
                .executable(name: "hotelwifi", targets: ["HotelWiFiCLI"]),
                .executable(name: "HotelWiFiHelper", targets: ["HotelWiFiHelper"]),
+               .executable(name: "HotelWiFiRadioAgent", targets: ["HotelWiFiRadioAgent"]),
                .executable(name: "HotelWiFiRecoveryHarness", targets: ["HotelWiFiRecoveryHarness"])],
     targets: [
         .target(name: "HotelWiFiPlatform", path: "HotelWiFi/Platform", publicHeadersPath: "include"),
@@ -14,6 +15,8 @@ let package = Package(
         .executableTarget(name: "HotelWiFiApp", dependencies: ["HotelWiFiCore"], path: "HotelWiFi/App"),
         .executableTarget(name: "HotelWiFiCLI", dependencies: ["HotelWiFiCore"], path: "HotelWiFi/CLI"),
         .executableTarget(name: "HotelWiFiHelper", dependencies: ["HotelWiFiCore", "HotelWiFiPlatform"], path: "HotelWiFi/Helper"),
+        .executableTarget(name: "HotelWiFiRadioAgent", dependencies: ["HotelWiFiCore"], path: "HotelWiFi/RadioAgent"),
         .executableTarget(name: "HotelWiFiRecoveryHarness", dependencies: ["HotelWiFiCore"], path: "HotelWiFi/Tests/FaultHarness"),
+        .testTarget(name: "HotelWiFiRadioTests", dependencies: ["HotelWiFiCore", "HotelWiFiRadioAgent"], path: "HotelWiFi/RadioAgentTests"),
         .testTarget(name: "HotelWiFiTests", dependencies: ["HotelWiFiCore"], path: "HotelWiFi/Tests", exclude: ["FaultHarness"], resources: [.copy("Fixtures")])
     ])

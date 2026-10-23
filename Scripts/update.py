@@ -98,16 +98,19 @@ def main():
         if APP.exists():
             os.rename(APP, backup.with_name(backup.stem + '-failed.app'))
         os.rename(backup, APP)
-        command(['/usr/bin/open', '-n', str(APP), '--args', '--repair-helper'])
+        command(['/usr/bin/open', '-n', str(APP), '--args', '--repair-helper', '--enable-auto-ap'])
         print('安装未完成，已恢复原应用并请求重新登记；恢复日志保留。', flush=True)
         raise
     started = datetime.now(timezone.utc).replace(microsecond=0)
-    command(['/usr/bin/open', '-n', str(APP), '--args', '--repair-helper'])
+    command(['/usr/bin/open', '-n', str(APP), '--args', '--repair-helper', '--enable-auto-ap'])
     print('新版已安装，等待经过身份校验的服务响应…', flush=True)
     wait_for(lambda: fresh_state('helper-registration.json', started).get('guardianLabel') == new_info['HotelWiFiGuardianLabel'] and
              fresh_state('helper-registration.json', started).get('helperReady') is True,
              '新版已安装但服务尚未通过响应验证。若系统要求，请批准后台服务并点击“修复后台服务”。恢复日志仍保留。')
-    print('更新完成：后台恢复服务已响应；原版本保留于 ' + str(backup), flush=True)
+    wait_for(lambda: fresh_state('radio-registration.json', started).get('ready') is True and
+             fresh_state('radio-registration.json', started).get('identityReadable') is True,
+             '新版已安装，但无线会话服务还未确认 AP 身份；请查看应用中的无线权限状态。')
+    print('更新完成：后台恢复服务和无线会话 Agent 已响应并读取 AP 身份；原版本保留于 ' + str(backup), flush=True)
 
 
 if __name__ == '__main__':

@@ -52,7 +52,7 @@ public enum SupportAction: String, Codable, Sendable {
         case .locationSettings: return "打开定位权限设置"
         case .refreshStatus: return "重新检查"
         case .repairHelper: return "修复后台服务"
-        case .portal: return "打开酒店登录检测页面"
+        case .portal: return "打开独立酒店登录窗口"
         case .recoverySettings: return "调整修复授权"
         case .copy: return "复制诊断给 ChatGPT"
         }
@@ -108,13 +108,21 @@ public enum DiagnosisBuilder {
         } else {
             findings.append(.init("local", "本机连接检查", "WiFi：\(state(c.wifiOn)) · 无线链路：\(state(f.associated)) · 地址：\(address(c)) · 路由：\(state(c.hasRoute))。本机状态正常不等于互联网已验证。", c.wifiOn == true && c.hasRoute == true ? .good : .unknown))
         }
+        if let portal = report?.portal, report?.currentValidatedAt == nil {
+            findings.append(.init("portalCheck", portal.state == .loginRequired ? "需要完成酒店 WiFi 登录" : "独立 WiFi 认证检测",
+                                  portal.detail, portal.state == .open ? .good : .warning,
+                                  portal.state == .open ? nil : .portal))
+        }
         let final = report?.windows.last(where: { $0.label.contains("最终") })
         let system = final?.samples.filter { $0.path == .system } ?? []
         if report?.currentValidatedAt != nil {
             findings.append(.init("application", "当前连接已通过应用请求验证", "最终复测 \(system.filter(\.complete).count) / \(system.count) 次完整成功；保留系统代理、VPN 与 TLS 校验。", .good))
         } else if !system.isEmpty {
             let failed = system.filter { !$0.complete }
-            if system.contains(where: \.complete) {
+            if report?.portal?.state == .open && !system.contains(where: \.complete) && (c.proxy.any || c.vpnPresent) {
+                findings.append(.init("protectedPath", "WiFi 认证入口可达，系统路径未通过",
+                    "独立 WiFi HTTP 检测通过，但正常代理／VPN 路径的请求失败（\(failureSummary(failed))）。这不构成信号差或尚未认证的证据，可打开独立登录窗口核对。", .failure, .portal))
+            } else if system.contains(where: \.complete) {
                 findings.append(.init("endpoints", "部分测试站点无法完成请求", "存在完整成功的请求，不能把某个端点失败当成整个网络断开。失败：\(failureSummary(failed))。", .warning, .copy))
             } else if failed.contains(where: { $0.failure == .redirect || $0.failure == .body || $0.status == 511 }) {
                 findings.append(.init("portal", "响应被跳转或与预期不符", "可能需要酒店登录，也可能是端点内容变化。打开登录检测页面确认；程序不会绕过认证。", .warning, .portal))
@@ -135,15 +143,20 @@ public enum DiagnosisBuilder {
         if let helper = capabilities?.capabilities.first(where: { $0.id == "helper" }), helper.state != .available {
             findings.append(.init("helper", "自动修复服务未就绪", helper.detail + " 本次仍可诊断，但需要特权的 DNS、重连和 DHCP 操作不会执行。", .warning, .repairHelper))
         }
-        if capabilities?.available("helper") == true, policy.allowReconnect, f.nameReadable, c.wifiOn != false,
+        if capabilities?.available("automaticAP") != true, capabilities?.available("helper") == true, policy.allowReconnect, f.nameReadable, c.wifiOn != false,
            let association = capabilities?.capabilities.first(where: { $0.id == "reconnect" }),
            association.state != .available {
             findings.append(.init("associationPermission", "名称已读取，自动重连暂不可用", association.detail, .warning, .refreshStatus, secondaryAction: .networkSettings))
         }
+        if policy.allowAutomaticAP == true, let capability = capabilities?.capabilities.first(where: { $0.id == "automaticAP" }) {
+            findings.append(.init("automaticAP", capability.state == .available ? "自动 AP 优化已就绪" : "自动 AP 服务需处理",
+                                  capability.detail, capability.state == .available ? .good : .warning,
+                                  capability.state == .available ? nil : .repairHelper))
+        }
         if !policy.allowReconnect || policy.linkRecovery?.allowIdleInterruption != true {
             findings.append(.init("authorization", "短暂重连尚未获完整授权", "可在“修复设置”中一次允许异常时重连及低流量中断。持续传输时仍不执行断开操作。", .warning, .recoverySettings))
         }
-        let primary = findings.first(where: { $0.level == .failure }) ?? findings.first(where: { ["portal","endpoints"].contains($0.id) })
+        let primary = findings.first(where: { $0.level == .failure }) ?? findings.first(where: { ["portal","portalCheck","endpoints"].contains($0.id) && $0.level != .good })
         if let primary { return .init(title: primary.title, explanation: primary.detail, findings: findings) }
         if report?.currentValidatedAt != nil {
             let changed = !(report?.changes.isEmpty ?? true)

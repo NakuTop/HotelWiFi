@@ -21,6 +21,7 @@ public struct OptimizationPolicy: Codable, Equatable, Sendable {
     public var allowReconnect = false
     public var allowSavedNetworks = false
     public var allowMetered = false
+    public var allowAutomaticAP: Bool?
     // Optional for backward-compatible decoding of existing saved policies.
     public var linkRecovery: LinkRecoveryPolicy?
     public var payloadLimit = 30_000_000
@@ -256,6 +257,7 @@ public struct SessionReport: Codable, Identifiable, Sendable {
     public var restored: [String] = []
     public var activeTemporary: [String] = []
     public var capabilities: CapabilityRegistry?
+    public var portal: PortalCheck?
     public var payloadBytes = 0
     public var interrupted = false
     public init(mode: String) { self.mode = mode }

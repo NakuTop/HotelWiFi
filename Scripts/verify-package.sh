@@ -11,7 +11,8 @@ printf '%s' "$LOCATION_ENTITLEMENTS" | python3 -c 'import sys,plistlib; assert p
 [[ "$(/usr/libexec/PlistBuddy -c 'Print BundleProgram' "$APP_DIR/Contents/Library/LaunchDaemons/com.hotelwifi.RecoveryGuardian.plist")" == 'Contents/MacOS/HotelWiFiHelper' ]]
 python3 "$PROJECT_DIR/Scripts/helper-constraint.py" verify "$APP_DIR"
 [[ "$(stat -f '%i' "$APP_DIR/Contents/MacOS/HotelWiFiApp")" != "$(stat -f '%i' "$APP_DIR/Contents/MacOS/hotelwifi")" ]]
-for binary in HotelWiFiApp hotelwifi HotelWiFiHelper; do
+python3 "$PROJECT_DIR/Scripts/agent-constraint.py" verify "$APP_DIR"
+for binary in HotelWiFiApp hotelwifi HotelWiFiHelper HotelWiFiRadioAgent; do
     [[ -x "$APP_DIR/Contents/MacOS/$binary" ]]
 done
 python3 "$PROJECT_DIR/Scripts/verify-binaries.py" "$APP_DIR"

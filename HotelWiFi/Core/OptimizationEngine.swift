@@ -15,6 +15,9 @@ public actor OptimizationEngine {
     private let controlled = ControlledProbe()
     private let dns = DNSProbe()
     private let helper = GuardianClient()
+    private let radio = RadioAgentClient()
+    private var activeRadio: UUID?
+    private var pendingRadioVerification: [MeasurementWindow]?
     private var budget: BudgetManager?
     private var running = false
     private var stopped = false
@@ -23,7 +26,7 @@ public actor OptimizationEngine {
     private var activeLink: LinkRecord?
     private var selectedCandidate: (WiFiCandidate, Bool)?
     private var pendingLinkVerification: [MeasurementWindow]?
-    private var ownsRecovery: Bool { active != nil || activeLink != nil }
+    private var ownsRecovery: Bool { active != nil || activeLink != nil || activeRadio != nil }
     private var nonce = UUID().uuidString
     private var session = UUID()
     private var expected: NetworkContext?
@@ -47,7 +50,11 @@ public actor OptimizationEngine {
         let version = String(decoding: curl.data, as: UTF8.self).split(separator: "\n").prefix(4).joined(separator: "\n")
         let detail = HelperDiagnostics.detail(ready: h.ok, message: h.message, registration: HotelWiFiService.registration.status,
                                               launchText: h.ok ? nil : HelperDiagnostics.launchState())
-        return (n, inspector.capabilities(n, helper: h.ok, curl: version, helperDetail: detail, associationIdentityReadable: h.associationIdentityReadable))
+        var capabilities = inspector.capabilities(n, helper: h.ok, curl: version, helperDetail: detail, associationIdentityReadable: h.associationIdentityReadable)
+        let r = await radio.call(.init(.status))
+        capabilities.capabilities.append(.init("automaticAP", r.ok && r.identityReadable == true ? .available : .permissionRequired,
+            r.ok && r.identityReadable == true ? "用户会话无线服务已确认 AP 身份，支持同网络自动择优、实际切换与失败恢复" : "无线会话服务尚未就绪：" + r.message))
+        return (n, capabilities)
     }
     public func observeChanges() {
         if events == nil { events = NetworkEvents(keysHandler: { [weak self] keys in Task { [weak self] in await self?.changed(keys) } }) }
@@ -81,6 +88,21 @@ public actor OptimizationEngine {
     public func restore() async -> GuardianResponse {
         heartbeat?.cancel(); heartbeat = nil
         ownTransition = true; defer { ownTransition = false }
+        if activeRadio != nil {
+            // Once recovery is requested, old measurement windows must never authorize
+            // a late commit, even if observing the original AP is temporarily impossible.
+            pendingRadioVerification = nil
+            var response = await radio.call(.init(.restore))
+            let deadline = Date().addingTimeInterval(35), pulse = NetworkEventPulse()
+            while response.ok && ![RadioPhase.restored, .committed, .conflict].contains(response.phase) && Date() < deadline {
+                await pulse.wait(); response = await radio.call(.init(.status))
+            }
+            guard response.ok, [RadioPhase.restored, .committed, .conflict].contains(response.phase) else {
+                return .init(ok: false, message: "AP 恢复尚未确认：" + response.message)
+            }
+            if response.phase == .restored { restoredChanges.append("automaticAP") }
+            activeRadio = nil; pendingRadioVerification = nil
+        }
         var result = await helper.call(.init(.restoreAll))
         let deadline = Date().addingTimeInterval(35), pulse = NetworkEventPulse()
         while !result.ok && result.linkRecord?.terminal == false && Date() < deadline {
@@ -127,6 +149,11 @@ public actor OptimizationEngine {
         }
     }
     private func beat() async {
+        if let id = activeRadio {
+            let r = await radio.call(.init(.heartbeat, nonce: nonce, transaction: id))
+            if !r.ok { stopped = true; native.cancel(); progress?(.init("无线恢复看护失联，停止复测并恢复")) }
+            return
+        }
         if let link = activeLink {
             let response = await helper.call(.init(.heartbeatLink, transaction: link.id, nonce: nonce))
             if !response.ok { stopped = true; budget?.stop(); native.cancel(); progress?(.init("关联恢复看护失联，停止实验")) }
@@ -216,11 +243,33 @@ public actor OptimizationEngine {
             report.observations.append(.init("本机检查已完成；没有无线连接时跳过互联网请求，未执行网络写入。"))
             progress(.init(report.conclusion)); return report
         }
+        progress(.init("正在通过 WiFi 独立检查酒店认证入口"))
+        if let name = network.context.interface, let interface = await PortalInterface.find(named: name) {
+            let portal = await CaptivePortalProbe.check(interface: interface)
+            try check()
+            report.portal = portal; report.observations.append(.init(portal.detail))
+            if portal.state == .loginRequired {
+                report.current = current(); report.localAfter = network.facts; report.finished = Date()
+                report.conclusion = "需要完成酒店 WiFi 登录"
+                report.evidence = "先完成认证，再测系统 HTTPS；暂不执行 DNS 修改或断线重连。"
+                progress(.init(report.conclusion)); return report
+            }
+        }
         var selectedEndpoints = endpoints
         let lowLoad = network.context.constrained == true || (network.context.expensive != false && !policy.allowMetered)
         if lowLoad { selectedEndpoints = endpoints.filter { $0.kind == .connectivity }; report.observations.append(.init("低数据模式、计费或计费状态未知：仅运行轻量连通性请求。")) }
         let count = lowLoad ? 1 : policy.initialRequests
+        var radioChanged = false
         do {
+            if mode == .optimize && policy.allowAutomaticAP == true {
+                let light = selectedEndpoints.filter { $0.kind == .connectivity }
+                let beforeAP = try await window("AP 优化前轻量复测", endpoints: light, count: 1, budget: b, timeout: 3)
+                report.windows.append(beforeAP)
+                radioChanged = try await optimizeAP(baseline: beforeAP, endpoints: light, budget: b, policy: policy, report: &report)
+                guard radioChanged || activeRadio == nil else {
+                    throw HWError.blocked("AP 恢复尚未确认，已停止后续优化尝试。")
+                }
+            }
             progress(.init("正在测量当前连接"))
             let baseline = try await BaselineCollector.collect(endpoints: selectedEndpoints, count: count) { endpoints, count, timeout, label in
                 try await self.window(label, endpoints: endpoints, count: count, budget: b, timeout: timeout)
@@ -234,7 +283,7 @@ public actor OptimizationEngine {
                 report.observations.append(.init("测试响应与预期不一致或发生跳转。", inference: "可能需要完成酒店登录；也可能是端点内容变化。请使用系统登录页面确认。"))
             }
             if a1.context.hasIPv6 == true && a1.context.hasIPv4 == false && a1.samples.contains(where: { $0.complete && $0.addressFamily == "IPv6" }) { report.observations.append(.init("IPv6 路径已完成应用请求，没有 IPv4 不构成 DHCP 故障。")) }
-            if mode != .diagnose && helperState.ok, let proposal = try await propose(baseline: a1, endpoints: selectedEndpoints, policy: policy, budget: b, report: &report) {
+            if !radioChanged && mode != .diagnose && helperState.ok, let proposal = try await propose(baseline: a1, endpoints: selectedEndpoints, policy: policy, budget: b, report: &report) {
                 report.observations.append(.init("独立诊断形成候选：\(proposal.field.rawValue)。系统实际路径仍需交错复测。"))
                 if mode == .dryRun { report.observations.append(.init("dry-run：只生成候选，没有准备或写入任何系统事务。")) }
                 else if !helperState.ok { report.observations.append(.init(helperState.message)) }
@@ -254,7 +303,7 @@ public actor OptimizationEngine {
                     }
                 }
             }
-            if mode == .optimize && active == nil && health == .failed && policy.allowReconnect {
+            if !radioChanged && mode == .optimize && active == nil && health == .failed && policy.allowReconnect {
                 try await recoverLink(baseline: a1, endpoints: selectedEndpoints, policy: policy, budget: b, helperReady: helperState.ok, report: &report)
             }
             if report.activeTemporary.isEmpty && report.conclusion == "尚未完成最终验证" {
@@ -294,6 +343,19 @@ public actor OptimizationEngine {
             if result.ok { report.restored += report.activeTemporary; report.activeTemporary = [] }
             report.conclusion = "最终验证未完成，已发起恢复"
         }
+        if report.currentValidatedAt != nil, let id = activeRadio, let verification = pendingRadioVerification {
+            let commit = await radio.call(.init(.commit, nonce: nonce, transaction: id, windows: verification))
+            if commit.ok {
+                activeRadio = nil; pendingRadioVerification = nil; heartbeat?.cancel(); heartbeat = nil
+                report.activeTemporary = []; report.conclusion = "已自动切换到更优 AP"
+                report.evidence = "实际目标 AP、两轮正常系统请求和最终当前连接均已确认。无线评分改善不代表共享带宽保证。"
+            } else {
+                let recovery = await restore(); report.currentValidatedAt = nil
+                report.activeTemporary = recovery.ok ? [] : ["AP 恢复待确认"]
+                report.conclusion = recovery.ok ? "AP 提交前状态变化，已核对恢复" : "AP 提交已停止，恢复仍待确认"
+                report.observations.append(.init(commit.message + "；" + recovery.message))
+            }
+        }
         if report.currentValidatedAt != nil && activeLink != nil, let verification = pendingLinkVerification {
             do {
                 _ = try await linkStep(.commitLink, verification: verification)
@@ -315,6 +377,69 @@ public actor OptimizationEngine {
         }
         // Diagnostics stay in memory. Durable recovery journals are independent of report storage.
         progress(.init(report.conclusion)); return report
+    }
+    private func optimizeAP(baseline: MeasurementWindow, endpoints: [ProbeEndpoint], budget: BudgetManager,
+                            policy: OptimizationPolicy, report: inout SessionReport) async throws -> Bool {
+        progress?(.init("正在确认可自动切换的同网络 AP"))
+        let survey = await radio.call(.init(.survey, nonce: nonce))
+        guard survey.ok else { report.observations.append(.init(survey.message)); return false }
+        if let survey = survey.survey { report.observations.append(.init(survey.recommendation)) }
+        try check()
+        let prepared = await radio.call(.init(.prepare, nonce: nonce, context: current(), policy: policy))
+        guard prepared.ok, let id = prepared.transaction else { report.observations.append(.init(prepared.message)); return false }
+        activeRadio = id; ownTransition = true
+        defer { ownTransition = false; expected = current() }
+        // Stop may arrive while the cross-process preparation request is in flight.
+        if stopped || Task.isCancelled {
+            let recovery = await restore(); report.observations.append(.init(recovery.message))
+            throw HWError.cancelled
+        }
+        progress?(.init("正在自动切换到更优 AP；原 AP 已登记恢复"))
+        let apply = await radio.call(.init(.apply, nonce: nonce, transaction: id))
+        guard apply.ok else {
+            let recovery = await restore(); report.observations.append(.init(apply.message + "；" + recovery.message)); return false
+        }
+        executedChanges.append("automaticAP")
+        heartbeat = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 8_000_000_000) } catch { return }
+                await self?.beat()
+            }
+        }
+        do {
+            let pulse = NetworkEventPulse(), deadline = Date().addingTimeInterval(25)
+            var observed = false
+            while Date() < deadline {
+                if stopped || Task.isCancelled { throw HWError.cancelled }
+                let status = await radio.call(.init(.status))
+                guard status.ok else { throw HWError.blocked(status.message) }
+                if status.targetObserved == true && status.phase == .waiting && current().hasRoute == true {
+                    observed = true; break
+                }
+                if [.restored, .conflict].contains(status.phase) { throw HWError.blocked(status.message) }
+                await pulse.wait()
+            }
+            guard observed else { throw HWError.blocked("未在时限内确认目标 AP 关联和地址。") }
+            expected = current()
+            var verification: [MeasurementWindow] = []
+            let lightweight = endpoints.filter { $0.kind == .connectivity }
+            for index in 1...2 {
+                progress?(.init("已切换 AP，正在进行第 \(index) 轮正常路径复测"))
+                let measured = try await window("AP 切换后复测 \(index)", endpoints: lightweight, count: 1, budget: budget, timeout: 4)
+                report.windows.append(measured); verification.append(measured)
+            }
+            guard RadioOptimizationGate.validCommit(verification, context: current()) else { throw HWError.blocked("两轮 AP 复测未全部通过。") }
+            pendingRadioVerification = verification
+            report.activeTemporary = ["automaticAP"]
+            report.conclusion = "AP 已切换，正在完成最终验证"
+            report.evidence = "实际目标 BSSID 已确认，两轮正常系统请求已通过；最终复测后才保留。"
+            return true
+        } catch {
+            let recovery = await restore()
+            report.observations.append(.init(error.localizedDescription + "；" + recovery.message))
+            report.conclusion = "AP 候选未通过验证，已核对恢复"
+            return false
+        }
     }
     public func measureBandwidth(policy: OptimizationPolicy) async throws -> SessionReport {
         guard !running, !ownsRecovery else { throw HWError.busy }

@@ -28,9 +28,10 @@ public enum HotelWiFiService {
 @objc public protocol GuardianXPC {
     func request(_ data: Data, withReply reply: @escaping (Data) -> Void)
 }
-public enum GuardianAction: String, Codable { case status, prepare, arm, apply, verify, commit, heartbeat, rollback, restoreAll, scanCandidates, prepareLink, armLink, applyLink, commitLink, heartbeatLink }
+public enum GuardianAction: String, Codable { case disassociateForAP, status, prepare, arm, apply, verify, commit, heartbeat, rollback, restoreAll, scanCandidates, prepareLink, armLink, applyLink, commitLink, heartbeatLink }
 public struct GuardianRequest: Codable {
     public var action: GuardianAction
+    public var requestedAt: Date?
     public var transaction: UUID?
     public var nonce: String?
     public var context: NetworkContext?
@@ -41,7 +42,7 @@ public struct GuardianRequest: Codable {
     public init(_ action: GuardianAction, transaction: UUID? = nil, nonce: String? = nil,
                 context: NetworkContext? = nil, policy: OptimizationPolicy? = nil, proposal: MutationProposal? = nil,
                 linkIntent: LinkIntent? = nil, verification: [MeasurementWindow]? = nil) {
-        self.action = action; self.transaction = transaction; self.nonce = nonce; self.context = context; self.policy = policy; self.proposal = proposal
+        self.action = action; self.requestedAt = Date(); self.transaction = transaction; self.nonce = nonce; self.context = context; self.policy = policy; self.proposal = proposal
         self.linkIntent = linkIntent; self.verification = verification
     }
 }

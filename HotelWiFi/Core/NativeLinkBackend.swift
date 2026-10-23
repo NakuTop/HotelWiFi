@@ -69,7 +69,7 @@ public final class NativeLinkBackend {
         if plan.action == .renewDHCP { try renewDHCP(plan.original) }
         else { try associate(plan.target) }
     }
-    public func associate(_ snapshot: AssociationSnapshot) throws {
+    public func associate(_ snapshot: AssociationSnapshot, beforeAssociation: (() throws -> Void)? = nil) throws {
         let i = try interface(snapshot.interface)
         guard profiles(i).contains(where: { $0.ssidData == snapshot.ssid && $0.security.rawValue == snapshot.security }) else { throw HWError.blocked("已保存网络已被用户移除。") }
         let password = try credential(snapshot.ssid, security: snapshot.security)
@@ -82,6 +82,7 @@ public final class NativeLinkBackend {
             throw HWError.blocked("本次目标网络/AP 不在范围内，未尝试其他网络。")
         }
         guard i.powerOn() else { throw HWError.blocked("用户已关闭 WiFi。") }
+        try beforeAssociation?()
         do { try i.associate(to: network, password: password) }
         catch { throw HWError.blocked("系统关联请求未完成（代码 \((error as NSError).code)）；必须以实际网络事件确认状态。") }
         // CoreWLAN return is only request completion; the guardian reads actual association and address events.

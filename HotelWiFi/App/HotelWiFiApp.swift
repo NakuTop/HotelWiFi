@@ -40,23 +40,39 @@ import Darwin
     var activationObserver: NSObjectProtocol?
     let statusRefresh = StatusRefreshCoordinator()
     var preparedForUpdate = false
+    var portalWindow: PortalWindow?
+    var portalTask: Task<Void, Never>?
+    var portalInterfaceName: String?
+    var portalGeneration = UUID()
+    @Published var portalStatus = ""
+    @Published var portalCheck: PortalCheck?
+    @Published var radioSurvey: RadioSurvey?
+    @Published var automaticPortal = UserDefaults.standard.object(forKey: "automaticPortal") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(automaticPortal, forKey: "automaticPortal") }
+    }
+    var automaticPortalTask: Task<Void, Never>?
+    var lastPortalCheck = Date.distantPast
+
     override init() {
         do { let s = try SecureStore.user(); settings = SettingsStore(store: s); engine = OptimizationEngine(store: s) }
         catch { settings = nil; engine = nil }
         super.init(); location.delegate = self
         do { policy = try settings?.policy() ?? .init() } catch { self.error = error.localizedDescription }
         if engine == nil { error = "无法打开私有恢复存储。请复制诊断，检查 HotelWiFi 数据目录的权限。" }
-        events = NetworkEvents { [weak self] in Task { @MainActor [weak self] in
+        events = NetworkEvents(keysHandler: { [weak self] keys in Task { @MainActor [weak self] in
             guard let self else { return }
-            self.liveStatusValid = false
+            self.liveStatusValid = false; self.portalCheck = nil; self.report?.portal = nil; self.radioSurvey = nil
+            if keys.contains(where: { $0.hasPrefix("State:/Network/Interface/") && $0.hasSuffix("/Link") }) {
+                self.closePortal()
+            } else if self.portalWindow == nil { self.portalGeneration = UUID() }
             self.refreshTask?.cancel()
-            self.refreshTask = Task { try? await Task.sleep(nanoseconds: 300_000_000); if !Task.isCancelled { await self.refresh() } }
-        } }
+            self.refreshTask = Task { try? await Task.sleep(nanoseconds: 300_000_000); if !Task.isCancelled { await self.refresh(); self.schedulePortalCheck() } }
+        } })
         sleepObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.liveStatusValid = false; _ = await self?.engine?.stop() }
+            Task { @MainActor [weak self] in self?.automaticPortalTask?.cancel(); self?.closePortal(); self?.liveStatusValid = false; _ = await self?.engine?.stop() }
         })
         sleepObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.liveStatusValid = false; self?.status = "已唤醒，请重新检查当前连接"; await self?.refresh() }
+            Task { @MainActor [weak self] in self?.liveStatusValid = false; self?.status = "已唤醒，请重新检查当前连接"; await self?.refresh(); self?.schedulePortalCheck() }
         })
         activationObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             // TCC and background-service approval changes need not generate a
@@ -64,7 +80,9 @@ import Darwin
             Task { @MainActor [weak self] in await self?.refresh() }
         }
         Task {
-            await engine?.observeChanges(); await refresh()
+            if CommandLine.arguments.contains("--enable-auto-ap") { policy.allowAutomaticAP = true; savePolicy() }
+            if policy.allowAutomaticAP == true || CommandLine.arguments.contains("--register-radio-agent") { await ensureRadioAgent() }
+            await engine?.observeChanges(); await refresh(); schedulePortalCheck()
             if CommandLine.arguments.contains("--repair-helper") || CommandLine.arguments.contains("--register-helper") { repairHelper() }
             if CommandLine.arguments.contains("--unregister-helper") { await unregisterHelper() }
             if CommandLine.arguments.contains("--prepare-update") { await prepareForUpdate() }
@@ -73,6 +91,10 @@ import Darwin
     var diagnosis: ConnectionDiagnosis {
         var currentReport = report
         if !liveStatusValid { currentReport?.currentValidatedAt = nil }
+        if !liveStatusValid, let portalCheck, portalCheck.checked > (currentReport?.portal?.checked ?? .distantPast) {
+            if currentReport == nil { currentReport = SessionReport(mode: "portal-check") }
+            currentReport?.portal = portalCheck
+        }
         return DiagnosisBuilder.diagnose(context: network ?? .init(), facts: facts, capabilities: capabilities, report: currentReport, policy: policy)
     }
     func refresh() async {
@@ -100,6 +122,11 @@ import Darwin
         }
     }
     func updateLocal(_ n: RuntimeNetwork) {
+        if portalWindow != nil && (n.context.interface != portalInterfaceName ||
+            n.context.serviceID != network?.serviceID || n.context.wifiOn == false ||
+            (n.ssid != nil && facts.nameReadable && n.ssid != networkName)) {
+            closePortal(); portalStatus = "网络已切换，请重新检查认证入口。"
+        }
         network = n.context; facts = n.facts
         facts.location = CLLocationManager.locationServicesEnabled() ? .from(location.authorizationStatus) : .servicesOff
         networkName = DiagnosisBuilder.name(ssid: n.ssid, context: n.context, facts: facts)
@@ -151,17 +178,31 @@ import Darwin
     func optimize(dry: Bool = false) {
         guard !busy, !helperBusy, let engine else { return }
         if !policy.completedOnboarding { savePolicy(); if error != nil { return } }
+        automaticPortalTask?.cancel(); automaticPortalTask = nil
+        closePortal()
         busy = true; report = nil; copyStatus = ""; liveStatusValid = false; completed = 0; total = 0
         status = "正在检查本机 WiFi、地址和权限"
         task = Task {
             defer { busy = false }
             do {
+                if !dry && policy.allowAutomaticAP == true { await ensureRadioAgent() }
+                if let name = network?.interface {
+                    status = "正在比较同网络接入点、信号和频段"
+                    radioSurvey = await RadioSurveyor.scan(interface: name)
+                }
+                try Task.checkCancellation()
                 try await engine.selectCandidate(candidates.first(where: { $0.id == candidateID }), approvePossibleCost: candidateCostApproved)
                 report = try await engine.run(mode: dry ? .dryRun : .optimize, policy: policy, endpoints: settings?.endpoints() ?? ProbeEndpoint.defaults) { [weak self] p in
                     Task { @MainActor [weak self] in self?.status = p.message; self?.completed = p.completed; self?.total = p.total }
                 }
                 liveStatusValid = report?.currentValidatedAt != nil
+                if liveStatusValid { portalStatus = "当前系统网络路径已通过最终复测。" }
                 status = report?.conclusion ?? "检查结束"; await refresh()
+                if !dry && report?.portal?.state == .loginRequired { await openPortal() }
+                else if !dry && report?.portal?.state == .unreachable && (network?.vpnPresent == true || network?.proxy.any == true) {
+                    portalStatus = "VPN／代理环境下认证检测受阻，正在尝试独立 WiFi 登录窗口。"
+                    await openPortal()
+                }
             } catch {
                 let restoration = await engine.stop()
                 self.error = error.localizedDescription
@@ -172,7 +213,71 @@ import Darwin
         }
     }
     func stop() {
+        task?.cancel()
+        automaticPortalTask?.cancel(); automaticPortalTask = nil
+        closePortal()
         Task { status = "正在停止并恢复原设置"; let r = await engine?.stop(); status = r?.message ?? "未创建网络事务"; liveStatusValid = false; await refresh() }
+    }
+    func schedulePortalCheck() {
+        guard automaticPortal, !busy, !helperBusy, portalWindow == nil else { return }
+        let delay = max(1, 15 - Date().timeIntervalSince(lastPortalCheck))
+        automaticPortalTask?.cancel()
+        automaticPortalTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+            guard let self, !self.busy, self.portalWindow == nil, let name = self.network?.interface,
+                  self.network?.wifiOn == true, self.facts.associated != false,
+                  let interface = await PortalInterface.find(named: name) else { return }
+            let generation = self.portalGeneration
+            self.lastPortalCheck = Date()
+            let result = await CaptivePortalProbe.check(interface: interface)
+            guard !Task.isCancelled, !self.busy, self.portalGeneration == generation,
+                  self.network?.interface == name, self.automaticPortal else { return }
+            self.portalCheck = result
+            if result.state == .loginRequired { await self.openPortal() }
+        }
+    }
+    func closePortal() {
+        portalGeneration = UUID()
+        portalTask?.cancel(); portalTask = nil
+        portalWindow?.close(); portalWindow = nil; portalInterfaceName = nil
+    }
+    func openPortal() async {
+        closePortal()
+        let generation = portalGeneration
+        guard let name = network?.interface, let interface = await PortalInterface.find(named: name) else {
+            portalStatus = "没有可用的 WiFi 接口，请先连接酒店无线网络。"; return
+        }
+        guard portalGeneration == generation else { return }
+        let controller = PortalWindow(); portalWindow = controller; portalInterfaceName = name
+        controller.onClose = { [weak self] in self?.closePortal(); self?.portalStatus = "认证窗口已关闭，当前连接仍待验证。" }
+        controller.onVerify = { [weak self] in self?.verifyPortalAndResume() }
+        do {
+            try await controller.show(interface: interface)
+            guard portalWindow === controller else { controller.close(); return }
+            portalStatus = "酒店登录窗口已打开；完成认证后自动复测。"
+            portalTask = Task { [weak self] in
+                let deadline = Date().addingTimeInterval(300)
+                var observedLogin = self?.report?.portal?.state == .loginRequired || self?.portalCheck?.state == .loginRequired
+                while Date() < deadline {
+                    do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+                    guard let self, self.portalWindow === controller else { return }
+                    let check = await CaptivePortalProbe.check(interface: interface)
+                    guard !Task.isCancelled, self.portalWindow === controller else { return }
+                    if check.state == .loginRequired { observedLogin = true }
+                    if check.state == .open && observedLogin { self.verifyPortalAndResume(); return }
+                }
+                guard let self, self.portalWindow === controller else { return }
+                self.closePortal(); self.portalStatus = "认证等待已超时，临时通道已关闭。可点击登录入口重试。"
+            }
+        } catch {
+            guard portalWindow === controller else { return }
+            closePortal(); portalStatus = "无法建立独立登录通道：" + error.localizedDescription
+        }
+    }
+    func verifyPortalAndResume() {
+        guard !busy else { return }
+        closePortal(); portalStatus = "正在复测酒店认证、系统 HTTPS 与 VPN／代理路径。"
+        optimize()
     }
     func localReport() -> SessionReport {
         var r = SessionReport(mode: "local-only"); r.current = network; r.localBefore = facts; r.localAfter = facts
@@ -183,6 +288,10 @@ import Darwin
         let state = busy ? "检查仍在进行；以下仅为已完成内容。" : liveStatusValid ? "测试完成时当前连接已验证。" : "当前连接尚未验证或此后已有网络变化；勿把旧结果视为当前正常。"
         var latest = report ?? localReport()
         latest.capabilities = capabilities; latest.localAfter = facts
+        if let radioSurvey {
+            latest.observations.append(.init(radioSurvey.recommendation))
+            latest.observations.append(.init(radioSurvey.detail))
+        }
         if let checked = capabilitiesCheckedAt {
             latest.observations.append(.init("本机权限和后台能力核对时间：" + checked.ISO8601Format() + "；请求结果保留各自的实际测量时间。"))
         }
@@ -195,7 +304,9 @@ import Darwin
     }
     func perform(_ action: SupportAction) {
         switch action {
-        case .networkSettings, .locationSettings, .portal:
+        case .portal:
+            Task { await openPortal() }
+        case .networkSettings, .locationSettings:
             if let url = action.destinationURL { open(url.absoluteString) }
         case .locationPermission: authorizeLocation()
         case .refreshStatus: recheckStatus()
@@ -210,6 +321,30 @@ import Darwin
             return
         }
     }
+    func ensureRadioAgent() async {
+        let client = RadioAgentClient()
+        var status = await client.call(.init(.status))
+        var detail: String?
+        if !status.ok {
+            do {
+                guard Bundle.main.bundleURL.path == "/Applications/HotelWiFi.app" else { throw HWError.blocked("无线服务需从已安装应用登记。") }
+                let service = RadioService.registration
+                if service.status == .notRegistered || service.status == .notFound {
+                    _ = LSRegisterURL(Bundle.main.bundleURL as CFURL, true)
+                    try service.register()
+                }
+                if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+                for _ in 0..<5 {
+                    status = await client.call(.init(.status)); if status.ok { break }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            } catch { detail = error.localizedDescription }
+        }
+        struct State: Encodable { let at = Date(); let ready: Bool; let identityReadable: Bool; let message: String }
+        if let data = try? JSONCoding.encoder.encode(State(ready: status.ok, identityReadable: status.identityReadable == true, message: detail ?? status.message)) {
+            try? settings?.store.write(data, named: "radio-registration.json")
+        }
+    }
     func repairHelper() {
         guard !busy, !helperBusy else { return }; helperBusy = true
         Task {
@@ -220,10 +355,12 @@ import Darwin
                 guard Bundle.main.bundleURL.path == "/Applications/HotelWiFi.app" else {
                     throw HWError.blocked("请将 HotelWiFi 安装到系统“应用程序”目录后再启用修复服务。当前 macOS 无法从用户目录可靠启动此后台服务。")
                 }
+                await ensureRadioAgent()
                 status = "正在核对并修复后台服务登记"
                 let h = await engine?.recoveryStatus()
                 if h?.ok == true {
-                    status = "后台修复服务已就绪"; await refresh(); return
+                    status = "后台修复服务已就绪"; await refresh()
+                    writeHelperRegistration(h, registrationError: nil); return
                 }
                 let service = HotelWiFiService.registration
                 if service.status == .requiresApproval {
@@ -257,12 +394,15 @@ import Darwin
             }
             await refresh()
             let response = await engine?.recoveryStatus()
-            struct Snapshot: Encodable { var at = Date(); var systemStatus: Int; var helperReady: Bool; var detail: String; var registrationError: String?; let guardianLabel = HotelWiFiService.jobIdentifier }
-            let snapshot = Snapshot(systemStatus: HotelWiFiService.registration.status.rawValue, helperReady: response?.ok == true,
-                detail: response?.message ?? "无响应", registrationError: registrationError)
-            if let data = try? JSONCoding.encoder.encode(snapshot) { try? settings?.store.write(data, named: "helper-registration.json") }
+            writeHelperRegistration(response, registrationError: registrationError)
             status = response?.ok == true ? "后台修复服务已就绪" : "后台服务仍未响应；问题原因已列在下方"
         }
+    }
+    func writeHelperRegistration(_ response: GuardianResponse?, registrationError: String?) {
+        struct Snapshot: Encodable { var at = Date(); var systemStatus: Int; var helperReady: Bool; var detail: String; var registrationError: String?; let guardianLabel = HotelWiFiService.jobIdentifier }
+        let snapshot = Snapshot(systemStatus: HotelWiFiService.registration.status.rawValue, helperReady: response?.ok == true,
+                                detail: response?.message ?? "无响应", registrationError: registrationError)
+        if let data = try? JSONCoding.encoder.encode(snapshot) { try? settings?.store.write(data, named: "helper-registration.json") }
     }
     func unregisterHelper() async {
         guard !busy, !helperBusy, let engine else { return }
@@ -273,7 +413,7 @@ import Darwin
         guard (response.ok && response.record?.terminal != false && response.linkRecord?.terminal != false) || absent else {
             error = "尚未确认遗留事务已恢复，不能移除恢复服务。"; return
         }
-        do { try await HotelWiFiService.registration.unregister(); status = "服务已注销；退出后可将应用移到废纸篓。" }
+        do { if RadioService.registration.status != .notRegistered { try await RadioService.registration.unregister() }; try await HotelWiFiService.registration.unregister(); status = "服务已注销；退出后可将应用移到废纸篓。" }
         catch { self.error = error.localizedDescription }
         await refresh()
     }
@@ -291,6 +431,13 @@ import Darwin
             let neverRunning = HelperDiagnostics.canRepairRegistration(HelperDiagnostics.launchState())
             guard drained || neverRunning || service.status == .notRegistered else {
                 throw HWError.blocked("服务仍在运行或恢复状态不明，不能替换应用。")
+            }
+            if RadioService.registration.status != .notRegistered {
+                let radio = await RadioAgentClient().call(.init(.restore))
+                guard radio.ok, radio.phase == nil || [RadioPhase.restored, .committed, .conflict].contains(radio.phase) else {
+                    throw HWError.blocked("无线事务尚未恢复，不能覆盖应用。")
+                }
+                try await RadioService.registration.unregister()
             }
             if service.status != .notRegistered { try await service.unregister() }
             status = "已准备更新；恢复日志保留，新服务启动后优先处理"
@@ -315,6 +462,8 @@ import Darwin
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model, let engine = model.engine else { return .terminateNow }
         if model.preparedForUpdate { return .terminateNow }
+        model.automaticPortalTask?.cancel()
+        model.closePortal()
         model.status = "退出前正在清理临时配置"
         Task { let result = await engine.stop(); if !result.ok { model.error = result.message }; sender.reply(toApplicationShouldTerminate: result.ok) }
         return .terminateLater
@@ -337,7 +486,7 @@ private struct MenuContent: View {
     var body: some View {
         Text(model.status)
         Button("打开 HotelWiFi") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
-        Button("一键检查并修复") { model.optimize() }.disabled(model.busy || model.helperBusy)
+        Button("一键自动优化") { model.optimize() }.disabled(model.busy || model.helperBusy)
         Button("停止并恢复") { model.stop() }
         Button("复制测试报告") { model.copyReport() }
         Divider(); Button("退出 HotelWiFi") { NSApp.terminate(nil) }
@@ -358,7 +507,7 @@ private struct MainWindow: View {
                     HStack(spacing: 20) {
                         Text(model.network?.radio.rssi.map { "信号 \($0) dBm" } ?? "信号未读取")
                         Text(model.network?.radio.band ?? "频段未读取")
-                        Text(model.network?.vpnPresent == true ? "保留 VPN 路径" : model.network?.proxy.any == true ? "保留系统代理" : "系统默认路径")
+                        Text(model.network?.vpnPresent == true ? "VPN 已启用 · 登录可走独立通道" : model.network?.proxy.any == true ? "系统代理已启用 · 登录可走独立通道" : "系统默认路径")
                     }.font(.caption).foregroundStyle(.secondary)
                     Divider()
                     Text(model.diagnosis.title).font(.title3.weight(.semibold))
@@ -371,6 +520,26 @@ private struct MainWindow: View {
                         Spacer()
                         Button(SupportAction.locationSettings.title) { model.perform(.locationSettings) }
                     }.padding(14).background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+                }
+                if !model.portalStatus.isEmpty {
+                    Label(model.portalStatus, systemImage: "network.badge.shield.half.filled").font(.callout)
+                }
+                Button("打开酒店登录入口", systemImage: "rectangle.and.arrow.up.right.and.arrow.down.left") { model.perform(.portal) }
+                    .disabled(model.busy || model.helperBusy)
+                if let survey = model.radioSurvey {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("无线接入点比较", systemImage: "antenna.radiowaves.left.and.right").font(.headline)
+                        Text(survey.recommendation).font(.callout)
+                        ForEach(Array(survey.ranked.prefix(5))) { point in
+                            HStack {
+                                Text(point.current ? "当前接入点" : "同网络候选")
+                                Spacer()
+                                Text("\(point.band) · 信道 \(point.channel.map(String.init) ?? "?") · \(point.rssi.map { "\($0) dBm" } ?? "信号未知")")
+                                Text("邻近同频 \(point.neighbors)").foregroundStyle(.secondary)
+                            }.font(.caption.monospacedDigit())
+                        }
+                        Text(survey.detail).font(.caption).foregroundStyle(.secondary)
+                    }.padding(18).background(accent.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
                 }
                 if let report = model.report { results(report) }
                 VStack(alignment: .leading, spacing: 14) {
@@ -420,7 +589,7 @@ private struct MainWindow: View {
                 HStack {
                     Button("复制测试报告", systemImage: "doc.on.doc") { model.copyReport() }
                     Spacer(); Button("停止并恢复") { model.stop() }
-                    Button("一键检查并修复") { model.optimize() }.buttonStyle(.borderedProminent)
+                    Button("一键自动优化") { model.optimize() }.buttonStyle(.borderedProminent)
                         .disabled(model.busy || model.helperBusy).keyboardShortcut(.return, modifiers: .command)
                 }
             }.padding(18).background(.bar)
@@ -462,13 +631,16 @@ private struct RepairSettings: View {
             HStack { Text("修复设置").font(.title2); Spacer(); Button("完成") { model.savePolicy(); model.showSettings = false } }
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    Toggle("连接网络后自动检测并打开酒店认证", isOn: $model.automaticPortal)
                     Text("授权保存在本机。之后一键执行，先确认故障，再修复并复测。").font(.callout).foregroundStyle(.secondary)
                     Toggle("允许验证有效的临时 DNS 修复", isOn: $model.policy.allowTemporaryDNS)
                     Toggle("允许单次请求比较 DNS 和直接连接", isOn: $model.policy.allowControlledDirect)
+                    Toggle("一键自动切换到更优的同网络 AP", isOn: Binding(get: { model.policy.allowAutomaticAP == true }, set: { model.policy.allowAutomaticAP = $0 }))
+                    Text("发现足够改善且没有持续传输时自动切换；两轮正常网络复测失败自动恢复原 AP。VPN 和代理设置保持原样。").font(.caption).foregroundStyle(.secondary)
                     Toggle("持续断网时允许短暂重连", isOn: $model.policy.allowReconnect)
                     Toggle("地址异常时允许请求 DHCP 续租", isOn: linkBinding(\.allowDHCPRenew))
                     Toggle("允许低流量时短暂中断已有会话", isOn: linkBinding(\.allowIdleInterruption))
-                    Text("即使开启，正在持续传输或连接健康时也不重连；WiFi 被手动关闭后不自动打开。").font(.caption).foregroundStyle(.secondary)
+                    Text("断网重连只处理持续故障；AP 优化也会比较可用连接的更优候选。持续传输时暂缓切换，手动关闭 WiFi 后不自动打开。").font(.caption).foregroundStyle(.secondary)
                     Divider()
                     HStack {
                         let locationAction: SupportAction = model.facts.location == .notRequested ? .locationPermission : .locationSettings
